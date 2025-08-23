@@ -5,7 +5,6 @@ from typing import Type
 import torch
 
 
-
 def get_flashattention_autograd_function_pytorch() -> Type:
     """
     Returns a torch.autograd.Function subclass that implements FlashAttention2.
