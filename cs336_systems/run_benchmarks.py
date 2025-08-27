@@ -10,6 +10,7 @@ import numpy.typing as npt
 import argparse
 import logging
 import torch._dynamo
+
 torch._dynamo.config.suppress_errors = True
 
 from cs336_basics.training import adamw
@@ -71,16 +72,10 @@ if __name__ == "__main__":
         "--eval_dataset", type=Path, required=True, help="Path to the memory-mapped evaluation dataset (.bin file)."
     )
 
-    # Benchmarking params
-    parser.add_argument(
-        "--w", type=int, default=5, help="Number of warmup steps before measuring time."
-    )
-    parser.add_argument(
-        "--n", type=int, default=10, help="Number of steps to measure time for."
-    )
-    parser.add_argument(
-        "--notime_backward", action="store_true"
-    )
+    # Benchmarking params
+    parser.add_argument("--w", type=int, default=5, help="Number of warmup steps before measuring time.")
+    parser.add_argument("--n", type=int, default=10, help="Number of steps to measure time for.")
+    parser.add_argument("--notime_backward", action="store_true")
 
     args = parser.parse_args()
 
@@ -126,7 +121,7 @@ if __name__ == "__main__":
         loss = cross_entropy_loss.cross_entropy_loss(logits=logits, targets=targets)
         loss = loss.float()
         loss.backward()
-    
+
     ts_forward = []
     ts_backward = []
     for _ in range(args.n):
@@ -144,7 +139,7 @@ if __name__ == "__main__":
             ts_backward.append(t1_backward - t0_backward)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-    
+
     print(ts_forward)
     print(np.mean(ts_forward))
     print(np.std(ts_forward))
