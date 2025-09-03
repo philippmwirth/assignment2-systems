@@ -19,11 +19,9 @@ def scaled_dot_product_attention(
     q: Float[torch.Tensor, "b s d"],
     k: Float[torch.Tensor, "b s d"],
     v: Float[torch.Tensor, "b s d"],
-    mask: Bool[torch.Tensor, "s s"],
 ) -> Float[torch.Tensor, "b s d"]:
     d_k = k.shape[-1]
     qk_scaled = einops.einsum(q, k, "... seq1 d, ... seq2 d -> ... seq1 seq2") / math.sqrt(d_k)
-    qk_scaled[..., ~mask] = -math.inf
     weights = softmax(x=qk_scaled, dim=-1)
     return einops.einsum(weights, v, "... seq1 seq2, ... seq2 d -> ... seq1 d")
 
@@ -52,9 +50,10 @@ if __name__ == "__main__":
             print(f"\n--- Benchmarking: d_model={d_model}, seq_len={seq_len} ---")
             try:
                 model = SimpleAttention().to(device)
-                q = torch.randn(BATCH_SIZE, seq_len, d_model, device=device)
-                k = torch.randn(BATCH_SIZE, seq_len, d_model, device=device)
-                v = torch.randn(BATCH_SIZE, seq_len, d_model, device=device)
+                model = torch.compile(model)
+                q = torch.randn(BATCH_SIZE, seq_len, d_model, device=device, requires_grad=True)
+                k = torch.randn(BATCH_SIZE, seq_len, d_model, device=device, requires_grad=True)
+                v = torch.randn(BATCH_SIZE, seq_len, d_model, device=device, requires_grad=True)
 
                 for _ in range(N_WARMUP):
                     output = model(q, k, v)
@@ -67,7 +66,7 @@ if __name__ == "__main__":
                     _ = model(q, k, v)
                     torch.cuda.synchronize()
                 t1_forward = timeit.default_timer()
-                t_forward = (t0_forward - t1_forward) / N_REPEATS
+                ts_forward = (t1_forward - t0_forward) / N_REPEATS
 
                 torch.cuda.reset_peak_memory_stats(device)
                 output = model(q, k, v)
@@ -78,34 +77,47 @@ if __name__ == "__main__":
                 t0_backward = timeit.default_timer()
                 for _ in range(N_REPEATS):
                     output = model(q, k, v)
-                    output.backward()
+                    output.mean().backward()
                     torch.cuda.synchronize()
                 t1_backward = timeit.default_timer()
                 ts_backward = (t1_backward - t0_backward) / N_REPEATS
 
-                result_df.append(
-                    {
-                        "d_model": d_model,
-                        "seq_len": seq_len,
-                        "Forward Time (ms)": f"{avg_time_fwd:.2f}",
-                        "Backward Time (ms)": f"{avg_time_bwd:.2f}",
-                        "Memory Before Backward (MB)": f"{mem_before_backward:.2f}",
-                    },
-                    ignore_index=True,
+                result_df = pd.concat(
+                    [
+                        result_df,
+                        pd.DataFrame(
+                            [
+                                {
+                                    "d_model": d_model,
+                                    "seq_len": seq_len,
+                                    "Forward Time (ms)": f"{ts_forward:.5f}",
+                                    "Backward Time (ms)": f"{ts_backward:.5f}",
+                                    "Memory Before Backward (MB)": f"{mem_before_backward:.5f}",
+                                }
+                            ]
+                        ),
+                    ],
                 )
 
             except torch.cuda.OutOfMemoryError:
                 print("Failed: Out of Memory.")
-                result_df.append(
-                    {
-                        "d_model": d_model,
-                        "seq_len": seq_len,
-                        "Forward Time (ms)": "OOM",
-                        "Backward Time (ms)": "OOM",
-                        "Memory Before Backward (MB)": "OOM",
-                    },
-                    ignore_index=True,
+                result_df = pd.concat(
+                    [
+                        result_df,
+                        pd.DataFrame(
+                            [
+                                {
+                                    "d_model": d_model,
+                                    "seq_len": seq_len,
+                                    "Forward Time (ms)": "OOM",
+                                    "Backward Time (ms)": "OOM",
+                                    "Memory Before Backward (MB)": "OOM",
+                                }
+                            ]
+                        ),
+                    ]
                 )
                 torch.cuda.empty_cache()
+            print(result_df.to_markdown())
 
     print(result_df.to_markdown())
