@@ -48,14 +48,15 @@ class FlashAttention(torch.autograd.Function):
             dim,
             FlashAttention.q_tile_size,
             FlashAttention.k_tile_size,
+            is_causal,
         )
         ctx.save_for_backward(L)
+        ctx.is_causal = is_causal
         return O
 
     @staticmethod
     def backward(ctx, grad_out):
         raise NotImplementedError()
-
 
 
 @triton.jit
@@ -72,6 +73,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
 ):
     """A tiled implementation of the flash attention fwd kernel.
 
@@ -89,6 +91,7 @@ def flash_fwd_kernel(
         D: dim
         Q_TILE_SIZE: B_q
         K_TILE_SIZE: B_k
+        is_causal: Whether or not to apply causal masks.
     """
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -150,6 +153,12 @@ def flash_fwd_kernel(
 
         # Tile pre softmax attention scores
         S = tl.dot(Q, tl.trans(K)) * scale
+        if is_causal:
+            row_idx = tl.arange(0, Q_TILE_SIZE)[:, None]
+            col_idx = tl.arange(0, K_TILE_SIZE)[None, :]
+            off_diagonal = query_tile_index * Q_TILE_SIZE - i * K_TILE_SIZE
+            mask = col_idx > (row_idx + off_diagonal)
+            S -= mask * 1e6
         m_i = tl.maximum(m, tl.max(S, axis=1))
         P = tl.exp(S - m_i[:, None])
         l_i = tl.exp(m - m_i) * l + tl.sum(P, axis=1)
