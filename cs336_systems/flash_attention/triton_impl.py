@@ -2,20 +2,18 @@ import math
 import einops
 from jaxtyping import Float
 import torch
-
-# Required fix, no idea why.
-# https://github.com/triton-lang/triton/issues/5142
 import os
 
-os.environ["TRITON_INTERPRET"] = "1"
+# Required for tests to pass (runs on CPU!).
+# https://github.com/triton-lang/triton/issues/5142
+# os.environ["TRITON_INTERPRET"] = "1"
 
 import triton
 import triton.language as tl
 
 
 class FlashAttention(torch.autograd.Function):
-    q_tile_size = 16
-    k_tile_size = 16
+    torch._dynamo.config.suppress_errors = True
 
     @staticmethod
     def forward(
@@ -35,7 +33,8 @@ class FlashAttention(torch.autograd.Function):
         L = torch.empty((batch_size, n_queries), device=Q.device)
 
         # Launch grid: (Tq , batch_size),
-        flash_fwd_kernel[(tl.cdiv(n_queries, FlashAttention.q_tile_size), batch_size)](
+        grid = lambda meta: (triton.cdiv(n_queries, meta["TILE_SIZE"]), batch_size)
+        flash_fwd_kernel[grid](
             Q,
             K,
             V,
@@ -59,8 +58,6 @@ class FlashAttention(torch.autograd.Function):
             n_keys,
             scale,
             dim,
-            FlashAttention.q_tile_size,
-            FlashAttention.k_tile_size,
             is_causal,
         )
         ctx.save_for_backward(Q, K, V, L, O)
@@ -91,6 +88,15 @@ class FlashAttention(torch.autograd.Function):
         return grads_from_recompute(Q.detach(), K.detach(), V.detach(), L.detach(), O.detach(), grad_out)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"TILE_SIZE": 16}),
+        triton.Config({"TILE_SIZE": 32}),
+        triton.Config({"TILE_SIZE": 64}),
+        triton.Config({"TILE_SIZE": 128}),
+    ],
+    key=["N_QUERIES", "N_KEYS", "D"],
+)
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr,
@@ -112,13 +118,14 @@ def flash_fwd_kernel(
     stride_od,
     stride_lb,
     stride_lq,
-    N_QUERIES,
-    N_KEYS,
-    scale,
+    N_QUERIES: tl.constexpr,
+    N_KEYS: tl.constexpr,
+    scale: tl.constexpr,
     D: tl.constexpr,
-    Q_TILE_SIZE: tl.constexpr,
-    K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    # Enable below for tests only.
+    # **kwargs,
 ):
     """A tiled implementation of the flash attention fwd kernel.
 
@@ -137,6 +144,7 @@ def flash_fwd_kernel(
         Q_TILE_SIZE: B_q
         K_TILE_SIZE: B_k
         is_causal: Whether or not to apply causal masks.
+        **kwargs: To catch triton extra arguments from
     """
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -148,8 +156,8 @@ def flash_fwd_kernel(
         Q_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, D),
         strides=(stride_qq, stride_qd),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
+        offsets=(query_tile_index * TILE_SIZE, 0),
+        block_shape=(TILE_SIZE, D),
         order=(1, 0),
     )
     K_block_ptr = tl.make_block_ptr(
@@ -157,7 +165,7 @@ def flash_fwd_kernel(
         shape=(N_KEYS, D),
         strides=(stride_kk, stride_kd),
         offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
+        block_shape=(TILE_SIZE, D),
         order=(1, 0),
     )
     V_block_ptr = tl.make_block_ptr(
@@ -165,43 +173,43 @@ def flash_fwd_kernel(
         shape=(N_KEYS, D),
         strides=(stride_vk, stride_vd),
         offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
+        block_shape=(TILE_SIZE, D),
         order=(1, 0),
     )
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_index * stride_ob,
         shape=(N_QUERIES, D),
         strides=(stride_oq, stride_od),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
+        offsets=(query_tile_index * TILE_SIZE, 0),
+        block_shape=(TILE_SIZE, D),
         order=(1, 0),
     )
     L_block_ptr = tl.make_block_ptr(
         L_ptr + batch_index * stride_lb,
         shape=(N_QUERIES,),
         strides=(stride_lq,),
-        offsets=(query_tile_index * Q_TILE_SIZE,),
-        block_shape=(Q_TILE_SIZE,),
+        offsets=(query_tile_index * TILE_SIZE,),
+        block_shape=(TILE_SIZE,),
         order=(0,),
     )
 
     # Prepare result accumulators.
-    O = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-    l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
-    m = tl.full((Q_TILE_SIZE,), value=-math.inf, dtype=tl.float32)
+    O = tl.zeros((TILE_SIZE, D), dtype=tl.float32)
+    l = tl.zeros((TILE_SIZE,), dtype=tl.float32)
+    m = tl.full((TILE_SIZE,), value=-1e6, dtype=tl.float32)
 
     # Load Q tile only once.
     Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")  # Q_TILE_SIZE x D
-    for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    for i in range(tl.cdiv(N_KEYS, TILE_SIZE)):
         K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")  # K_TILE_SIZE x D
         V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")  # K_TILE_SIZE x D
 
         # Tile pre softmax attention scores
         S = tl.dot(Q, tl.trans(K)) * scale
         if is_causal:
-            row_idx = tl.arange(0, Q_TILE_SIZE)[:, None]
-            col_idx = tl.arange(0, K_TILE_SIZE)[None, :]
-            off_diagonal = query_tile_index * Q_TILE_SIZE - i * K_TILE_SIZE
+            row_idx = tl.arange(0, TILE_SIZE)[:, None]
+            col_idx = tl.arange(0, TILE_SIZE)[None, :]
+            off_diagonal = query_tile_index * TILE_SIZE - i * TILE_SIZE
             mask = col_idx > (row_idx + off_diagonal)
             S -= mask * 1e6
         m_i = tl.maximum(m, tl.max(S, axis=1))
@@ -215,8 +223,8 @@ def flash_fwd_kernel(
         O = O_i
         l = l_i
         m = m_i
-        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
-        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (TILE_SIZE, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (TILE_SIZE, 0))
 
     # Compute results.
     O_final = O / l[:, None]
@@ -225,3 +233,25 @@ def flash_fwd_kernel(
     # Store results.
     tl.store(O_block_ptr, O_final.to(Q.dtype), boundary_check=(0, 1))
     tl.store(L_block_ptr, L_final, boundary_check=(0,))
+
+
+if __name__ == "__main__":
+
+    def test_timing_flash_forward_backward():
+        n_heads = 16
+        d_head = 64
+        sequence_length = 16384
+        q, k, v = torch.randn(
+            3, n_heads, sequence_length, d_head, device="cuda", dtype=torch.float16, requires_grad=True
+        )
+        flash = torch.compile(FlashAttention.apply)
+
+        def flash_forward_backward():
+            o = flash(q, k, v, True)
+            loss = o.sum()
+            loss.backward()
+
+        results = triton.testing.do_bench(flash_forward_backward, rep=100, warmup=1000)
+        print(results)
+
+    test_timing_flash_forward_backward()

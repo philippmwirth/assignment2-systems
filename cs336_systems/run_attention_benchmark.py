@@ -2,11 +2,8 @@ import torch
 import torch.nn as nn
 import einops
 import timeit
-import pandas
-from jaxtyping import Float, Bool
+from jaxtyping import Float
 import math
-import time
-import itertools
 import pandas as pd
 
 
@@ -19,9 +16,14 @@ def scaled_dot_product_attention(
     q: Float[torch.Tensor, "b s d"],
     k: Float[torch.Tensor, "b s d"],
     v: Float[torch.Tensor, "b s d"],
+    is_causal: bool,
 ) -> Float[torch.Tensor, "b s d"]:
     d_k = k.shape[-1]
+    s = k.shape[-2]
     qk_scaled = einops.einsum(q, k, "... seq1 d, ... seq2 d -> ... seq1 seq2") / math.sqrt(d_k)
+    if is_causal:
+        mask = torch.triu(torch.ones((s, s), dtype=torch.long), diagonal=1).bool()
+        qk_scaled[..., mask] -= 1e6
     weights = softmax(x=qk_scaled, dim=-1)
     return einops.einsum(weights, v, "... seq1 seq2, ... seq2 d -> ... seq1 d")
 
@@ -30,14 +32,14 @@ class SimpleAttention(nn.Module):
     """A simple attention implementation to faciliate benchmarking."""
 
     def forward(self, q, k, v):
-        return scaled_dot_product_attention(q, k, v)
+        return scaled_dot_product_attention(q, k, v, True)
 
 
-BATCH_SIZE = 8
+BATCH_SIZE = 1
 D_MODELS = [16, 32, 64, 128]
-SEQ_LENS = [256, 1024, 4096, 8192, 16384]
-N_REPEATS = 100
-N_WARMUP = 10
+SEQ_LENS = [256, 1024, 4096, 8192, 16384, 65536]
+N_REPEATS = 1000
+N_WARMUP = 1000
 
 
 if __name__ == "__main__":
@@ -50,7 +52,7 @@ if __name__ == "__main__":
             print(f"\n--- Benchmarking: d_model={d_model}, seq_len={seq_len} ---")
             try:
                 model = SimpleAttention().to(device)
-                model = torch.compile(model)
+                # model = torch.compile(model)
                 q = torch.randn(BATCH_SIZE, seq_len, d_model, device=device, requires_grad=True)
                 k = torch.randn(BATCH_SIZE, seq_len, d_model, device=device, requires_grad=True)
                 v = torch.randn(BATCH_SIZE, seq_len, d_model, device=device, requires_grad=True)
@@ -79,6 +81,7 @@ if __name__ == "__main__":
                     output = model(q, k, v)
                     output.mean().backward()
                     torch.cuda.synchronize()
+                    del output
                 t1_backward = timeit.default_timer()
                 ts_backward = (t1_backward - t0_backward) / N_REPEATS
 

@@ -2,6 +2,10 @@ import pytest
 import torch
 from einops import einsum, rearrange
 
+import os
+
+os.environ["TRITON_INTERPRET"] = "1"
+
 from .adapters import (
     get_flashattention_autograd_function_pytorch,
     get_flashattention_autograd_function_triton,
