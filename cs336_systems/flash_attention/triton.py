@@ -1,6 +1,6 @@
 import math
-from jaxtyping import Float
 import einops
+from jaxtyping import Float
 import torch
 
 # Required fix, no idea why.
@@ -63,13 +63,32 @@ class FlashAttention(torch.autograd.Function):
             FlashAttention.k_tile_size,
             is_causal,
         )
-        ctx.save_for_backward(L)
+        ctx.save_for_backward(Q, K, V, L, O)
         ctx.is_causal = is_causal
+        ctx.scale = scale
+        ctx.seq_len = n_queries
         return O
 
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError()
+        Q, K, V, L, O = ctx.saved_tensors
+
+        @torch.compile()
+        def grads_from_recompute(Q_, K_, V_, L_, O_, dO):
+            D = (O_ * dO).sum(axis=-1)
+            S = einops.einsum(Q_, K_, "... seq1 d, ... seq2 d -> ... seq1 seq2") * ctx.scale
+            if ctx.is_causal:
+                mask = torch.triu(torch.ones((ctx.seq_len, ctx.seq_len), dtype=torch.long), diagonal=1).bool()
+                S[..., mask] -= 1e6
+            P = (S - L_.unsqueeze(-1)).exp()
+            dV = einops.einsum(P, dO, "... seq1 seq2, ... seq1 d -> ... seq2 d")
+            dP = einops.einsum(dO, V_, "... seq1 d, ... seq2 d -> ... seq1 seq2")
+            dS = P * (dP - D.unsqueeze(-1))
+            dQ = einops.einsum(dS, K_, "... seq1 seq2, ... seq2 d -> ... seq1 d") * ctx.scale
+            dK = einops.einsum(dS, Q_, "... seq1 seq2, ... seq1 d -> ... seq2 d") * ctx.scale
+            return dQ, dK, dV, None
+
+        return grads_from_recompute(Q.detach(), K.detach(), V.detach(), L.detach(), O.detach(), grad_out)
 
 
 @triton.jit
