@@ -4,7 +4,6 @@ from cs336_systems.flash_attention import triton_impl
 import einops
 from jaxtyping import Float
 import math
-import pandas as pd
 import argparse
 import triton
 import pprint
@@ -96,5 +95,6 @@ if __name__ == "__main__":
                         "error": str(e),
                     }
                 )
+                raise e
 
     pprint.pprint(results)
