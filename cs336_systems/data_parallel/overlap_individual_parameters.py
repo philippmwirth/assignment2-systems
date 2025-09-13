@@ -5,11 +5,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 
-
-
-
 class DDP(nn.Module):
-
     def __init__(
         self,
         module: nn.Module,
@@ -37,7 +33,7 @@ class DDP(nn.Module):
         for handle in self.handles:
             handle.wait()
         self.handles.clear()
-        # This fakes an AVG reduce op that is not available on Gloo backend.
+        # This fakes an AVG reduce op that is not available on Gloo backend.
         world_size = torch.distributed.get_world_size()
         for param in self.module.parameters():
             if param.grad is not None:

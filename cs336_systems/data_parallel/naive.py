@@ -10,13 +10,9 @@ import dataclasses
 
 
 class Model(nn.Module):
-
     def __init__(self):
         super().__init__()
-        self.ff = nn.Sequential(
-            nn.Linear(10, 10),
-            nn.Linear(10, 1)
-        )
+        self.ff = nn.Sequential(nn.Linear(10, 10), nn.Linear(10, 1))
 
     def forward(self, x: Float[torch.Tensor, "... d"]) -> Float[torch.Tensor, "... one"]:
         return self.ff(x)
@@ -46,7 +42,7 @@ def naive_ddp(rank: int, world_size: int, config: TrainingConfig) -> None:
     setup(rank=rank, world_size=world_size)
     dist.barrier()
     torch.manual_seed(rank)
-    
+
     device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
     non_parallel_model = Model().to(device)
     model = copy.deepcopy(non_parallel_model)
@@ -67,7 +63,7 @@ def naive_ddp(rank: int, world_size: int, config: TrainingConfig) -> None:
         for param in model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
-        
+
         optimizer.step()
 
     # Train local model
@@ -76,10 +72,7 @@ def naive_ddp(rank: int, world_size: int, config: TrainingConfig) -> None:
         for _ in range(config.n_steps):
             optimizer.zero_grad()
             data = torch.cat(
-                [
-                    torch.ones((config.global_batch_size // world_size, 10)) * i
-                    for i in range(world_size)
-                ],
+                [torch.ones((config.global_batch_size // world_size, 10)) * i for i in range(world_size)],
                 dim=0,
             )
             logit = non_parallel_model(data)
